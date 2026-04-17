@@ -42,6 +42,15 @@ Zephyr fetch is attempted inside `fetch_via_rest` after `filtered` sprint issues
 If `ZEPHYR_SCALE_API_KEY` is missing or the API call fails, the script falls back silently to
 manual entry (no pre-fills).
 
+## Outlook draft
+
+After all prompts are answered, the script calls `build_html_email()` then `_open_outlook_draft()`:
+
+- `build_html_email()` renders the report as clean HTML (Arial font, inline styles, `<table>` for key-value pairs, `<ul>` for metric bullets).
+- `_open_outlook_draft()` builds a MIME `multipart/alternative` message (plain-text + HTML parts), writes it to a temp `.eml` file, then runs an AppleScript via `osascript` that tells Outlook to `make new outgoing message with properties {subject:..., source:...}` and `open` it.
+- **Important:** the AppleScript is written to a temp `.applescript` file and run as `osascript <file>` — NOT `osascript -e`. The `«class utf8»` token (U+00AB/U+00BB) is silently mangled when passed via `-e` on the command line, causing a syntax error.
+- Falls back silently to the plain-text copy prompt if `osascript` exits non-zero.
+
 ## Architecture
 
 Single-file script (`qa_report.py`). Flow:
@@ -50,7 +59,7 @@ Single-file script (`qa_report.py`). Flow:
 2. **Fetch** — For each board: tries Atlassian MCP via Anthropic SDK (`fetch_via_mcp`), falls back to direct Jira REST API (`fetch_via_rest`), falls back to manual prompts (`prompt_auto_fields`).
 3. **Epic detection** — `fetch_via_rest` queries `/rest/api/3/search/jql` (note: old `/rest/api/3/search` returns 410). Detects epics via the `parent` field (Next-gen Jira) or `customfield_10014` Epic Link (Classic Jira). AICW keywords are matched from `target_epics` against both matched epic names and the sprint name.
 4. **Prompts** — `prompt_board_fields(aicw)` collects test case counts, defects, and blockers per board (prompts include the AICW name for clarity). `prompt_uat_fields()` is called once after all boards for UAT details.
-5. **Output** — `build_combined_email()` renders a single email with one section per board plus a shared UAT block at the bottom; `main()` prints the combined email.
+5. **Output** — `build_combined_email()` renders the plain-text email; `build_html_email()` renders the HTML version; `_open_outlook_draft()` opens it in Outlook; `main()` orchestrates all steps.
 
 ## Board configuration
 

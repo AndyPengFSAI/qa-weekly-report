@@ -704,33 +704,64 @@ def _open_outlook_draft(subject: str, html_body: str) -> bool:
     """
     Open Microsoft Outlook with a new compose window pre-filled with the given
     subject and HTML body.  Uses AppleScript (macOS only).
+
+    Outlook 16 on Mac does not expose an 'html content' AppleScript property.
+    Instead we set the 'source' property to a MIME multipart/alternative message
+    so Outlook renders the HTML part in the compose window.
+
     Returns True on success, False if Outlook is unavailable or the script fails.
     """
-    # Write HTML to a temp file — avoids embedding a large string in AppleScript
+    # Build a MIME multipart/alternative body so Outlook renders the HTML part
+    boundary  = "OutlookDraftBoundary"
+    mime_body = (
+        f"MIME-Version: 1.0\n"
+        f'Content-Type: multipart/alternative; boundary="{boundary}"\n'
+        f"\n"
+        f"--{boundary}\n"
+        f"Content-Type: text/plain; charset=UTF-8\n"
+        f"\n"
+        f"Please view this message in an HTML-capable mail client.\n"
+        f"--{boundary}\n"
+        f"Content-Type: text/html; charset=UTF-8\n"
+        f"\n"
+        f"{html_body}\n"
+        f"--{boundary}--\n"
+    )
+
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".html", delete=False, encoding="utf-8"
+        mode="w", suffix=".eml", delete=False, encoding="utf-8"
     ) as fh:
-        fh.write(html_body)
-        html_path = fh.name
+        fh.write(mime_body)
+        mime_path = fh.name
 
     subject_safe = subject.replace("\\", "\\\\").replace('"', '\\"')
+
+    # «class utf8» (U+00AB / U+00BB) must be in the AppleScript source file —
+    # passing them via osascript -e mangles the encoding.  Write to a temp file.
     script = (
-        f'set htmlPath to POSIX file "{html_path}"\n'
-        f'set htmlContent to read htmlPath as «class utf8»\n'
+        f'set mimePath to POSIX file "{mime_path}"\n'
+        f'set mimeContent to read mimePath as \u00abclass utf8\u00bb\n'
         f'tell application "Microsoft Outlook"\n'
         f'    activate\n'
         f'    set theMsg to make new outgoing message with properties '
-        f'{{subject:"{subject_safe}", html content:htmlContent}}\n'
+        f'{{subject:"{subject_safe}", source:mimeContent}}\n'
         f'    open theMsg\n'
         f'end tell\n'
     )
 
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".applescript", delete=False, encoding="utf-8"
+    ) as sf:
+        sf.write(script)
+        script_path = sf.name
 
-    try:
-        os.unlink(html_path)
-    except OSError:
-        pass
+    result = subprocess.run(["osascript", script_path], capture_output=True, text=True)
+
+    for path in (mime_path, script_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     return result.returncode == 0
 

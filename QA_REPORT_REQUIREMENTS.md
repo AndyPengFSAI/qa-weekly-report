@@ -154,12 +154,14 @@ Thank you,
 1. On launch, derive reporting week from current date
 2. For each board:
    a. Fetch sprint data (MCP → REST API → manual fallback)
-   b. Display sprint preview (sprint name, AICW, ticket counts)
-   c. Prompt user for per-board manual fields (test cases, defects, blockers)
+   b. If board has `zephyr_project_key`: fetch sprint-scoped test case stats from Zephyr Scale
+   c. Display sprint preview (sprint name, AICW, ticket counts; Zephyr pre-fills if available)
+   d. Prompt user for per-board manual fields — executed/outstanding show `[N]` defaults from Zephyr; press Enter to accept or type to override
 3. After all boards, prompt for UAT fields once
 4. If UAT = `n`, show `UAT Status – N/A` in the email
 5. Print a single combined formatted email to terminal
-6. Print: `✅ Email ready — copy the above and paste into Outlook.`
+6. Open Microsoft Outlook with a new compose window pre-filled with the subject and formatted HTML body
+7. If Outlook is unavailable: print `✅ Email ready — copy the above and paste into Outlook.`
 
 ---
 
@@ -169,6 +171,8 @@ Thank you,
 - If Jira REST API fails → print troubleshooting instructions, then prompt user to enter all fields manually
 - If active sprint cannot be found → raise error with board details
 - If epic names cannot be matched → warn user, list available epics, count all sprint tickets as fallback
+- If Zephyr Scale API fails or key is missing → skip pre-fills, prompt manually (no crash)
+- If Outlook AppleScript fails → fall back to plain-text copy prompt (no crash)
 
 ---
 
@@ -180,6 +184,8 @@ qa-report/
 ├── .env                          # Env vars (gitignored)
 ├── .env.example                  # Template for env vars
 ├── requirements.txt              # Python dependencies (install via conda)
+├── README.md                     # Setup and usage guide
+├── CLAUDE.md                     # Guidance for Claude Code
 └── QA_REPORT_REQUIREMENTS.md    # This file
 ```
 
