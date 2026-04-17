@@ -31,16 +31,20 @@ BOARDS = [
         "customer":     "Healius",
     },
     {
-        "label":        "Xander / HEAL",
-        "base_url":     "https://futuresecureai.atlassian.net",
-        "board_id":     "3426",
-        "target_epics": ["Xander"],
-        "customer":     "Healius",
+        "label":             "Xander / HEAL",
+        "base_url":          "https://futuresecureai.atlassian.net",
+        "board_id":          "3426",
+        "target_epics":      ["Xander"],
+        "customer":          "Healius",
+        "zephyr_project_key": "HEAL",
     },
 ]
 
 PENDING_STATUSES = {"READY FOR QA", "IN TESTING"}
 TESTED_STATUSES  = {"AWAITING DEPLOYMENT", "DONE"}
+
+ZEPHYR_BASE             = "https://api.zephyrscale.smartbear.com/v2"
+ZEPHYR_EXECUTED_STATUSES = {"pass", "fail", "blocked"}  # lowercase for case-insensitive compare
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,14 @@ def _jira_auth_headers() -> dict:
         )
     creds = base64.b64encode(f"{email}:{token}".encode()).decode()
     return {"Authorization": f"Basic {creds}", "Accept": "application/json"}
+
+
+def _zephyr_headers() -> dict:
+    """Bearer-Auth headers for the Zephyr Scale REST API."""
+    token = os.environ.get("ZEPHYR_SCALE_API_KEY", "")
+    if not token:
+        raise EnvironmentError("ZEPHYR_SCALE_API_KEY must be set in .env")
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +307,17 @@ def fetch_via_rest(board: dict) -> dict:
         if i["fields"]["status"]["name"].upper() in TESTED_STATUSES
     )
 
+    # Zephyr Scale test case stats — sprint-scoped via issue links
+    zephyr_stats: dict | None = None
+    if board.get("zephyr_project_key"):
+        try:
+            sprint_issue_keys = {issue["key"] for issue in filtered}
+            zephyr_stats = fetch_zephyr_test_stats(
+                board["zephyr_project_key"], sprint_issue_keys
+            )
+        except Exception as z_err:
+            print(f"  ⚠ Zephyr fetch failed ({z_err})")
+
     return {
         "team_member":   team_member,
         "sprint":        sprint_name,
@@ -302,7 +325,107 @@ def fetch_via_rest(board: dict) -> dict:
         "total":         total_count,
         "pending":       pending_count,
         "tested":        tested_count,
+        "zephyr_stats":  zephyr_stats,
     }
+
+
+# ---------------------------------------------------------------------------
+# Data fetching — Zephyr Scale (sprint-scoped test case stats)
+# ---------------------------------------------------------------------------
+
+def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
+    """
+    Fetch test case execution stats from Zephyr Scale, scoped to the current sprint.
+
+    Only counts test cases that are linked to at least one Jira issue in
+    sprint_issue_keys.  Returns executed / outstanding based on latest execution
+    status per test case.
+    """
+    headers = _zephyr_headers()
+
+    # 1. For each sprint issue key, fetch linked test cases via the issueKey filter.
+    #    The Zephyr Scale API supports GET /testcases?issueKey={key} which returns
+    #    all test cases with a COVERAGE link to that Jira issue.
+    sprint_tc_keys: list[str] = []
+    seen_tc_keys:   set[str]  = set()
+    page_size = 100
+
+    for issue_key in sprint_issue_keys:
+        start_at = 0
+        while True:
+            r = requests.get(
+                f"{ZEPHYR_BASE}/testcases",
+                params={
+                    "projectKey": project_key,
+                    "issueKey":   issue_key,
+                    "maxResults":  page_size,
+                    "startAt":     start_at,
+                },
+                headers=headers,
+                timeout=20,
+            )
+            r.raise_for_status()
+            body  = r.json()
+            page  = body.get("values", [])
+            total = body.get("total", 0)
+            for tc in page:
+                tc_key = tc.get("key", "")
+                if tc_key and tc_key not in seen_tc_keys:
+                    sprint_tc_keys.append(tc_key)
+                    seen_tc_keys.add(tc_key)
+            start_at += len(page)
+            if start_at >= total or not page:
+                break
+
+    if not sprint_tc_keys:
+        return {"executed": 0, "outstanding": 0, "total": 0}
+
+    sprint_tc_set = set(sprint_tc_keys)
+
+    # 2. Collect ALL test executions in the project; keep latest per test case key.
+    latest_status: dict[str, str] = {}   # tc_key → status name
+    latest_date:   dict[str, str] = {}   # tc_key → actualEndDate string (for tie-breaking)
+    start_at = 0
+    while True:
+        r = requests.get(
+            f"{ZEPHYR_BASE}/testexecutions",
+            params={
+                "projectKey": project_key,
+                "maxResults":  page_size,
+                "startAt":     start_at,
+            },
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        body  = r.json()
+        page  = body.get("values", [])
+        total = body.get("total", 0)
+        for ex in page:
+            tc_key = (ex.get("testCase") or {}).get("key", "")
+            if tc_key not in sprint_tc_set:
+                continue
+            status = (ex.get("status") or {}).get("name", "")
+            date   = ex.get("actualEndDate") or ""
+            # Keep the most recent execution (higher date string wins; equal → last record)
+            if tc_key not in latest_date or date >= latest_date[tc_key]:
+                latest_status[tc_key] = status
+                latest_date[tc_key]   = date
+        start_at += len(page)
+        if start_at >= total or not page:
+            break
+
+    # 3. Count executed vs outstanding.
+    executed    = 0
+    outstanding = 0
+    for tc_key in sprint_tc_keys:
+        status = latest_status.get(tc_key, "")
+        if status.lower() in ZEPHYR_EXECUTED_STATUSES:
+            executed += 1
+        else:
+            outstanding += 1
+
+    return {"executed": executed, "outstanding": outstanding, "total": len(sprint_tc_keys)}
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +437,18 @@ def _ask(prompt_text: str, required: bool = True) -> str:
         value = input(f"  {prompt_text} ").strip()
         if value or not required:
             return value
+        print("    (Required — please enter a value.)")
+
+
+def _ask_with_default(prompt_text: str, default: str | None = None) -> str:
+    """Like _ask but shows a pre-filled default; Enter accepts it."""
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"  {prompt_text}{suffix} ").strip()
+        if value:
+            return value
+        if default is not None:
+            return default
         print("    (Required — please enter a value.)")
 
 
@@ -342,11 +477,30 @@ def prompt_auto_fields(board: dict) -> dict:
     }
 
 
-def prompt_board_fields(aicw: str) -> dict:
-    """Prompt for per-board manual fields (test cases, defects, blockers)."""
+def prompt_board_fields(aicw: str, zephyr_stats: dict | None = None) -> dict:
+    """Prompt for per-board manual fields (test cases, defects, blockers).
+
+    If zephyr_stats is provided, pre-fills executed/outstanding from Zephyr Scale
+    and lets the user press Enter to accept or type a number to override.
+    """
     print()
-    test_cases_executed    = _ask(f"How many test cases did you execute for {aicw} this week?")
-    test_cases_outstanding = _ask(f"How many test cases are still outstanding for {aicw}?")
+    if zephyr_stats:
+        print(
+            f"  Zephyr Scale (sprint-scoped): "
+            f"{zephyr_stats['executed']} executed, "
+            f"{zephyr_stats['outstanding']} outstanding "
+            f"({zephyr_stats['total']} test cases linked to sprint tickets)\n"
+            f"  Press Enter to accept, or type a number to override."
+        )
+    exe_default = str(zephyr_stats["executed"])    if zephyr_stats else None
+    out_default = str(zephyr_stats["outstanding"]) if zephyr_stats else None
+
+    test_cases_executed    = _ask_with_default(
+        f"How many test cases did you execute for {aicw} this week?", exe_default
+    )
+    test_cases_outstanding = _ask_with_default(
+        f"How many test cases are still outstanding for {aicw}?", out_default
+    )
     defects_raised         = _ask(
         f"How many defects did you raise for {aicw}? (tickets sent to dev after testing)"
     )
@@ -516,7 +670,10 @@ def main() -> None:
         print("  Please answer the following questions:")
         print("  " + "-" * 56)
 
-        board_manual = prompt_board_fields(auto_data.get("aicw_customer", board["label"]))
+        board_manual = prompt_board_fields(
+            auto_data.get("aicw_customer", board["label"]),
+            zephyr_stats=auto_data.get("zephyr_stats"),
+        )
         boards_data.append((auto_data, board_manual))
 
     # UAT — asked once after all boards

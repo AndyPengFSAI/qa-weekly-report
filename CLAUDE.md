@@ -21,6 +21,26 @@ Copy `.env.example` to `.env` and fill in:
 - `ATLASSIAN_EMAIL` — Atlassian account email
 - `ATLASSIAN_API_TOKEN` — API token from https://id.atlassian.com/manage-profile/security/api-tokens
 - `ANTHROPIC_API_KEY` — optional; only needed for the MCP path (currently unavailable due to org policy)
+- `ZEPHYR_SCALE_API_KEY` — Zephyr Scale API key for the Xander/HEAL board (see below)
+
+## Zephyr Scale integration
+
+The Xander/HEAL board has `zephyr_project_key: "HEAL"` set, enabling automatic test case fetching.
+
+**How to get the API key:**
+1. Go to `https://futuresecureai.atlassian.net`
+2. Top nav → **Apps** → **Zephyr Scale**
+3. Click the settings/gear icon → **API Access Tokens**
+4. Generate a new token and copy it
+5. Add to `.env` as `ZEPHYR_SCALE_API_KEY=<token>`
+
+**What it fetches:** test cases linked to Jira issues in the current active sprint (sprint-scoped,
+not folder-based). Counts executed (Pass/Fail/Blocked) vs outstanding (Unexecuted/any other).
+The user sees the pre-filled numbers and can press Enter to accept or type to override.
+
+Zephyr fetch is attempted inside `fetch_via_rest` after `filtered` sprint issues are determined.
+If `ZEPHYR_SCALE_API_KEY` is missing or the API call fails, the script falls back silently to
+manual entry (no pre-fills).
 
 ## Architecture
 
