@@ -10,6 +10,8 @@ import os
 import base64
 import json
 import re
+import subprocess
+import tempfile
 from datetime import datetime, timedelta
 
 import anthropic
@@ -612,6 +614,128 @@ def build_combined_email(
 
 
 # ---------------------------------------------------------------------------
+# HTML email builder + Outlook launcher
+# ---------------------------------------------------------------------------
+
+def build_html_email(
+    boards_data: list,
+    uat: dict,
+    reporting_week: str,
+) -> str:
+    """Build an HTML email body suitable for Outlook's compose window."""
+    team_member = boards_data[0][0].get("team_member", "Unknown")
+
+    def kv_row(label: str, value: str) -> str:
+        return (
+            f'<tr>'
+            f'<td style="padding:2px 16px 2px 0;white-space:nowrap;vertical-align:top">'
+            f'<b>{label}</b></td>'
+            f'<td style="padding:2px 0;vertical-align:top">{value}</td>'
+            f'</tr>'
+        )
+
+    board_html_parts: list[str] = []
+    for auto, manual in boards_data:
+        aicw   = auto.get("aicw_customer", "N/A")
+        sprint = auto.get("sprint", "Unknown")
+        part = (
+            f'<p style="margin:16px 0 4px 0;padding:6px 10px;background:#f0f0f0">'
+            f'<b>[ {aicw} ]</b></p>'
+            f'<table style="border-collapse:collapse;margin-bottom:10px">'
+            f'{kv_row("AICW / Customer:", aicw)}'
+            f'{kv_row("Sprint:", sprint)}'
+            f'</table>'
+            f'<p style="margin:10px 0 4px 0"><b>QA Metrics for Current Sprint</b></p>'
+            f'<ul style="margin:0 0 10px 16px;padding:0;line-height:1.8">'
+            f'<li>Total Tickets: {auto.get("total", 0)}</li>'
+            f'<li>Pending Testing: {auto.get("pending", 0)}</li>'
+            f'<li>Tested: {auto.get("tested", 0)}</li>'
+            f'<li>Test Cases Executed: {manual["test_cases_executed"]}</li>'
+            f'<li>Test Cases Outstanding: {manual["test_cases_outstanding"]}</li>'
+            f'<li>Defects raised (tickets sent to dev): {manual["defects_raised"]}</li>'
+            f'</ul>'
+            f'<p style="margin:10px 0 4px 0"><b>Blockers / Notes</b></p>'
+            f'<p style="margin:0 0 6px 0">{manual["blockers"]}</p>'
+        )
+        board_html_parts.append(part)
+
+    if uat.get("uat_applicable"):
+        conf = uat.get("confluence_updated", "N/A")
+        if uat.get("confluence_link"):
+            link = uat["confluence_link"]
+            conf += f' – <a href="{link}">{link}</a>'
+        uat_html = (
+            f'<p style="margin:16px 0 4px 0"><b>UAT Status</b></p>'
+            f'<ul style="margin:0 0 10px 16px;padding:0;line-height:1.8">'
+            f'<li>UAT Start Date: {uat.get("start_date", "N/A")}</li>'
+            f'<li>UAT End Date: {uat.get("end_date", "N/A")}</li>'
+            f'<li>Test Cases Preparation Status: {uat.get("prep_status", "N/A")}</li>'
+            f'<li>Requirements Modified: {uat.get("requirements_modified", "N/A")}</li>'
+            f'<li>Confluence Updated: {conf}</li>'
+            f'</ul>'
+        )
+    else:
+        uat_html = '<p style="margin:16px 0 4px 0"><b>UAT Status – N/A</b></p>'
+
+    hr = '<hr style="border:none;border-top:1px solid #cccccc;margin:14px 0">'
+    boards_body = "\n".join(board_html_parts)
+
+    return (
+        '<html><head><meta charset="utf-8"></head>\n'
+        '<body style="font-family:Arial,sans-serif;font-size:11pt;color:#222222;'
+        'margin:0;padding:16px;max-width:680px">\n'
+        '<p style="margin:0 0 10px 0">Hi Team,</p>\n'
+        '<p style="margin:0 0 10px 0">Please find my weekly QA status update below.</p>\n'
+        f'{hr}\n'
+        f'<p style="margin:0 0 8px 0"><b>Weekly QA Status</b></p>\n'
+        f'<table style="border-collapse:collapse;margin-bottom:12px">\n'
+        f'{kv_row("Team Member:", team_member)}\n'
+        f'{kv_row("Reporting Week:", reporting_week)}\n'
+        f'</table>\n'
+        f'{boards_body}\n'
+        f'{uat_html}\n'
+        f'{hr}\n'
+        f'<p style="margin:0">Thank you,<br>{team_member}</p>\n'
+        f'</body></html>'
+    )
+
+
+def _open_outlook_draft(subject: str, html_body: str) -> bool:
+    """
+    Open Microsoft Outlook with a new compose window pre-filled with the given
+    subject and HTML body.  Uses AppleScript (macOS only).
+    Returns True on success, False if Outlook is unavailable or the script fails.
+    """
+    # Write HTML to a temp file — avoids embedding a large string in AppleScript
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".html", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(html_body)
+        html_path = fh.name
+
+    subject_safe = subject.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'set htmlPath to POSIX file "{html_path}"\n'
+        f'set htmlContent to read htmlPath as «class utf8»\n'
+        f'tell application "Microsoft Outlook"\n'
+        f'    activate\n'
+        f'    set theMsg to make new outgoing message with properties '
+        f'{{subject:"{subject_safe}", html content:htmlContent}}\n'
+        f'    open theMsg\n'
+        f'end tell\n'
+    )
+
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+
+    try:
+        os.unlink(html_path)
+    except OSError:
+        pass
+
+    return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -693,7 +817,16 @@ def main() -> None:
     print()
     print("=" * 60)
     print()
-    print("✅ Email ready — copy the above and paste into Outlook.")
+    # Open Outlook with a pre-filled HTML draft
+    team_member_name = boards_data[0][0].get("team_member", "")
+    subject = f"Weekly QA Status Update – {team_member_name} – {reporting_week}"
+    html = build_html_email(boards_data, uat_data, reporting_week)
+
+    print("  Opening Outlook draft...")
+    if _open_outlook_draft(subject, html):
+        print("✅ Outlook draft opened — review and send.")
+    else:
+        print("✅ Email ready — copy the above and paste into Outlook.")
     print()
 
 
