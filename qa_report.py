@@ -42,8 +42,11 @@ BOARDS = [
     },
 ]
 
-PENDING_STATUSES = {"READY FOR QA", "IN TESTING"}
-TESTED_STATUSES  = {"AWAITING DEPLOYMENT", "DONE"}
+PENDING_STATUSES  = {"READY FOR QA", "IN TESTING"}
+TESTED_STATUSES   = {"AWAITING DEPLOYMENT", "DONE"}
+# Tickets with these statuses are excluded from ALL counts (total / pending / tested).
+# "Won't Do" = cancelled/rejected; these are irrelevant to QA metrics.
+EXCLUDED_STATUSES = {"WON'T DO", "WONT DO", "WONT'T DO"}
 
 ZEPHYR_BASE             = "https://api.zephyrscale.smartbear.com/v2"
 ZEPHYR_EXECUTED_STATUSES = {"pass", "fail", "blocked"}  # lowercase for case-insensitive compare
@@ -196,7 +199,9 @@ def fetch_via_rest(board: dict) -> dict:
     r.raise_for_status()
     team_member = r.json().get("displayName", "Unknown")
 
-    # 2. Active sprint
+    # 2. Active sprint — prefer the sprint whose name contains a target_epic keyword.
+    #    Boards like FDW/402 run multiple parallel active sprints (Oscar, Melinda, etc.)
+    #    so we must pick the right one rather than blindly taking [0].
     r = requests.get(
         f"{base_url}/rest/agile/1.0/board/{board_id}/sprint",
         params={"state": "active"},
@@ -207,8 +212,18 @@ def fetch_via_rest(board: dict) -> dict:
     sprints = r.json().get("values", [])
     if not sprints:
         raise ValueError(f"No active sprint found for board {board_id}.")
-    sprint_id   = sprints[0]["id"]
-    sprint_name = sprints[0]["name"]
+
+    def _sprint_score(s: dict) -> int:
+        name = s["name"].lower()
+        return sum(1 for kw in target_epics if kw.lower() in name)
+
+    best_sprint = max(sprints, key=_sprint_score)
+    if _sprint_score(best_sprint) == 0:
+        # No sprint name matches any target epic keyword — fall back to first sprint
+        best_sprint = sprints[0]
+        print(f"  ⚠️  No sprint matched {target_epics}; using '{best_sprint['name']}'")
+    sprint_id   = best_sprint["id"]
+    sprint_name = best_sprint["name"]
 
     # 3. Fetch ALL sprint issues with epic-detection fields.
     #    No project filter — board is multi-project.
@@ -250,6 +265,10 @@ def fetch_via_rest(board: dict) -> dict:
         if issue_type == "Epic":
             continue  # don't count epics themselves
 
+        # Skip cancelled / rejected tickets — they have no QA value
+        if fields["status"]["name"].upper() in EXCLUDED_STATUSES:
+            continue
+
         epic_name: str | None = None
 
         # Next-gen: parent whose issuetype is Epic
@@ -267,6 +286,10 @@ def fetch_via_rest(board: dict) -> dict:
 
         if epic_name:
             found_epic_names.add(epic_name)
+            # Exclude epics explicitly marked as cross-project / universal tasks
+            # (e.g. "Migration Tickets (Universal)") — they are not sprint-specific.
+            if "(universal)" in epic_name.lower():
+                continue
             if any(t.lower() in epic_name.lower() for t in target_epics):
                 matched_epic_names.add(epic_name)
                 filtered.append(issue)
@@ -279,9 +302,21 @@ def fetch_via_rest(board: dict) -> dict:
                 print(f"       {name}")
         else:
             print("     No epic data found on any sprint issue.")
-        print("     Counting ALL sprint tickets (no epic filter).")
-        filtered = [i for i in all_issues
-                    if i["fields"].get("issuetype", {}).get("name") != "Epic"]
+        print("     Counting all sprint tickets in this sprint (no epic filter).")
+
+        def _epic_name_of(issue: dict) -> str:
+            pf = (issue["fields"].get("parent") or {}).get("fields") or {}
+            if pf.get("issuetype", {}).get("name") == "Epic":
+                return pf.get("summary", "")
+            ek = issue["fields"].get("customfield_10014")
+            return epic_name_map.get(ek, "") if ek else ""
+
+        filtered = [
+            i for i in all_issues
+            if i["fields"].get("issuetype", {}).get("name") != "Epic"
+            and i["fields"]["status"]["name"].upper() not in EXCLUDED_STATUSES
+            and "(universal)" not in _epic_name_of(i).lower()
+        ]
 
     # Build AICW: keywords from target_epics that appear in matched epic names
     # OR in the sprint name (e.g. "FDW UC 1.2 Melinda Sprint 11" → Melinda).
@@ -339,18 +374,37 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
     """
     Fetch test case execution stats from Zephyr Scale, scoped to the current sprint.
 
-    Only counts test cases that are linked to at least one Jira issue in
-    sprint_issue_keys.  Returns executed / outstanding based on latest execution
-    status per test case.
-    """
-    headers = _zephyr_headers()
+    Only counts test cases linked to at least one Jira issue in sprint_issue_keys.
+    Returns executed / outstanding based on the LATEST execution status per test case.
 
-    # 1. For each sprint issue key, fetch linked test cases via the issueKey filter.
-    #    The Zephyr Scale API supports GET /testcases?issueKey={key} which returns
-    #    all test cases with a COVERAGE link to that Jira issue.
+    Key API facts (discovered from live data):
+    - testexecutions uses field "testExecutionStatus" (not "status") with only {id, self}
+    - testexecutions are returned ASCENDING (oldest first), so the LAST item is latest
+    - testCase field in executions has no "key"; extract it from the "self" URL
+    """
+    headers   = _zephyr_headers()
+    page_size = 100
+
+    # 0. Build status ID → name map for this project (fetched once, not hardcoded).
+    r = requests.get(
+        f"{ZEPHYR_BASE}/statuses",
+        params={"projectKey": project_key, "statusType": "TEST_EXECUTION", "maxResults": 50},
+        headers=headers,
+        timeout=20,
+    )
+    r.raise_for_status()
+    status_id_to_name: dict[int, str] = {
+        s["id"]: s["name"] for s in r.json().get("values", [])
+    }
+    # IDs for statuses considered "executed" (Pass / Fail / Blocked)
+    executed_ids: set[int] = {
+        sid for sid, name in status_id_to_name.items()
+        if name.lower() in ZEPHYR_EXECUTED_STATUSES
+    }
+
+    # 1. Collect unique test case keys linked to any sprint issue.
     sprint_tc_keys: list[str] = []
     seen_tc_keys:   set[str]  = set()
-    page_size = 100
 
     for issue_key in sprint_issue_keys:
         start_at = 0
@@ -360,8 +414,8 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
                 params={
                     "projectKey": project_key,
                     "issueKey":   issue_key,
-                    "maxResults":  page_size,
-                    "startAt":     start_at,
+                    "maxResults": page_size,
+                    "startAt":    start_at,
                 },
                 headers=headers,
                 timeout=20,
@@ -369,12 +423,12 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
             r.raise_for_status()
             body  = r.json()
             page  = body.get("values", [])
-            total = body.get("total", 0)
             for tc in page:
                 tc_key = tc.get("key", "")
                 if tc_key and tc_key not in seen_tc_keys:
                     sprint_tc_keys.append(tc_key)
                     seen_tc_keys.add(tc_key)
+            total    = body.get("total", 0)
             start_at += len(page)
             if start_at >= total or not page:
                 break
@@ -382,47 +436,57 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
     if not sprint_tc_keys:
         return {"executed": 0, "outstanding": 0, "total": 0}
 
-    sprint_tc_set = set(sprint_tc_keys)
+    # 2. For each TC key, fetch its executions and inspect the LAST one (newest).
+    #    The API returns executions in ASCENDING date order, so the last item is
+    #    the most recent execution.  We also fall back to the highest actualEndDate
+    #    across all pages in case ordering is inconsistent.
+    def _tc_key_from_exec(ex: dict) -> str:
+        """Extract TC key (e.g. HEAL-T38) from the self URL in the testCase field."""
+        import re as _re
+        self_url = (ex.get("testCase") or {}).get("self", "")
+        m = _re.search(r"/testcases/([^/]+)/versions", self_url)
+        return m.group(1) if m else ""
 
-    # 2. Collect ALL test executions in the project; keep latest per test case key.
-    latest_status: dict[str, str] = {}   # tc_key → status name
-    latest_date:   dict[str, str] = {}   # tc_key → actualEndDate string (for tie-breaking)
-    start_at = 0
-    while True:
-        r = requests.get(
-            f"{ZEPHYR_BASE}/testexecutions",
-            params={
-                "projectKey": project_key,
-                "maxResults":  page_size,
-                "startAt":     start_at,
-            },
-            headers=headers,
-            timeout=20,
-        )
-        r.raise_for_status()
-        body  = r.json()
-        page  = body.get("values", [])
-        total = body.get("total", 0)
-        for ex in page:
-            tc_key = (ex.get("testCase") or {}).get("key", "")
-            if tc_key not in sprint_tc_set:
-                continue
-            status = (ex.get("status") or {}).get("name", "")
-            date   = ex.get("actualEndDate") or ""
-            # Keep the most recent execution (higher date string wins; equal → last record)
-            if tc_key not in latest_date or date >= latest_date[tc_key]:
-                latest_status[tc_key] = status
-                latest_date[tc_key]   = date
-        start_at += len(page)
-        if start_at >= total or not page:
-            break
+    latest_status_id: dict[str, int] = {}   # tc_key → status id of latest execution
+    latest_date:      dict[str, str] = {}   # tc_key → actualEndDate for tie-breaking
+
+    for tc_key in sprint_tc_keys:
+        start_at = 0
+        while True:
+            r = requests.get(
+                f"{ZEPHYR_BASE}/testexecutions",
+                params={
+                    "projectKey": project_key,
+                    "testCase":   tc_key,
+                    "maxResults": page_size,
+                    "startAt":    start_at,
+                },
+                headers=headers,
+                timeout=20,
+            )
+            r.raise_for_status()
+            body  = r.json()
+            page  = body.get("values", [])
+            for ex in page:
+                status_id = (ex.get("testExecutionStatus") or {}).get("id")
+                if status_id is None:
+                    continue
+                date = ex.get("actualEndDate") or ""
+                # Keep the execution with the latest date
+                if tc_key not in latest_date or date >= latest_date[tc_key]:
+                    latest_status_id[tc_key] = status_id
+                    latest_date[tc_key]      = date
+            total    = body.get("total", len(page))
+            start_at += len(page)
+            if start_at >= total or not page:
+                break
 
     # 3. Count executed vs outstanding.
     executed    = 0
     outstanding = 0
     for tc_key in sprint_tc_keys:
-        status = latest_status.get(tc_key, "")
-        if status.lower() in ZEPHYR_EXECUTED_STATUSES:
+        sid = latest_status_id.get(tc_key)   # None → never executed
+        if sid is not None and sid in executed_ids:
             executed += 1
         else:
             outstanding += 1
@@ -591,7 +655,7 @@ def build_combined_email(
     return (
         f"Subject: Weekly QA Status Update – {team_member} – {reporting_week}\n"
         f"\n"
-        f"Hi Team,\n"
+        f"Hi Alekha,\n"
         f"\n"
         f"Please find my weekly QA status update below.\n"
         f"\n"
@@ -684,7 +748,7 @@ def build_html_email(
         '<html><head><meta charset="utf-8"></head>\n'
         '<body style="font-family:Arial,sans-serif;font-size:11pt;color:#222222;'
         'margin:0;padding:16px;max-width:680px">\n'
-        '<p style="margin:0 0 10px 0">Hi Team,</p>\n'
+        '<p style="margin:0 0 10px 0">Hi Alekha,</p>\n'
         '<p style="margin:0 0 10px 0">Please find my weekly QA status update below.</p>\n'
         f'{hr}\n'
         f'<p style="margin:0 0 8px 0"><b>Weekly QA Status</b></p>\n'
