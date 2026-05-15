@@ -7,7 +7,7 @@ A Python script that automatically generates a weekly QA status email by pulling
 - Pulls sprint data (sprint name, ticket counts, team member) from Jira via REST API
 - Supports multiple Jira boards / instances in one run
 - Detects active use cases (epics) from sprint issues and the sprint name
-- **Zephyr Scale integration** — auto-fetches sprint-scoped test case execution stats (executed / outstanding) for the Xander/HEAL board and pre-fills the prompts
+- **Zephyr Scale integration** — auto-fetches sprint-scoped test case execution stats (executed / outstanding) and pre-fills the prompts; Xander filters to its folder subtree, Dixie uses issue-link matching
 - Prompts for per-use-case metrics (test cases, defects, blockers)
 - Asks UAT questions once at the end and appends a shared UAT section
 - **Auto-opens Microsoft Outlook** with a properly formatted HTML draft — subject, body, and all metrics pre-filled
@@ -37,7 +37,7 @@ Edit `.env` and fill in:
 |---|---|
 | `ATLASSIAN_EMAIL` | Your Atlassian account email |
 | `ATLASSIAN_API_TOKEN` | API token from [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens) |
-| `ZEPHYR_SCALE_API_KEY` | Zephyr Scale API key for the Xander/HEAL board (see [Zephyr Scale setup](#zephyr-scale-setup)) |
+| `ZEPHYR_SCALE_API_KEY` | Zephyr Scale API key (see [Zephyr Scale setup](#zephyr-scale-setup)) |
 | `ANTHROPIC_API_KEY` | *(Optional)* Only needed for the Atlassian MCP path |
 
 ## Usage
@@ -51,7 +51,7 @@ The script will:
 
 1. Fetch sprint data for each configured board
 2. Show a preview (sprint name, AICW/Customer, ticket counts)
-3. For Xander/HEAL: fetch Zephyr Scale test case stats and pre-fill executed/outstanding prompts
+3. Fetch Zephyr Scale test case stats for each board and pre-fill executed/outstanding prompts
 4. Prompt for per-board manual fields (press Enter to accept Zephyr pre-fills)
 5. Ask UAT questions once at the end
 6. Print the plain-text email to the terminal
@@ -73,17 +73,17 @@ Weekly QA Status
 Team Member:    Andy Peng
 Reporting Week: 13 Apr – 17 Apr 2026
 
-[ Reva/Melinda – Healius ]
+[ Dixie – Healius ]
 
-AICW / Customer: Reva/Melinda – Healius
-Sprint:          FDW UC 1.2 Melinda Sprint 11
+AICW / Customer: Dixie – Healius
+Sprint:          HEAL Dixie Sprint 5
 
 QA Metrics for Current Sprint
 
   • Total Tickets:                              8
   • Pending Testing:                            3
   • Tested:                                     4
-  • Test Cases Executed:                        10
+  • Test Cases Executed:                        6
   • Test Cases Outstanding:                     2
   • Defects raised (tickets sent to dev):       1
 
@@ -110,11 +110,12 @@ Boards are defined in the `BOARDS` list at the top of `qa_report.py`:
 ```python
 BOARDS = [
     {
-        "label":        "Healius / FDW  (Reva · Melinda · Dixie)",
-        "base_url":     "https://healius-digital.atlassian.net",
-        "board_id":     "402",
-        "target_epics": ["Reva", "Melinda", "Dixie"],
-        "customer":     "Healius",
+        "label":             "Dixie / HEAL",
+        "base_url":          "https://futuresecureai.atlassian.net",
+        "board_id":          "3566",
+        "target_epics":      ["Dixie"],
+        "customer":          "Healius",
+        "zephyr_project_key": "HEAL",   # enables Zephyr Scale auto-fetch
     },
     {
         "label":             "Xander / HEAL",
@@ -123,15 +124,18 @@ BOARDS = [
         "target_epics":      ["Xander"],
         "customer":          "Healius",
         "zephyr_project_key": "HEAL",   # enables Zephyr Scale auto-fetch
+        "zephyr_folder":     "Xander AI",  # restricts fetch to this folder subtree
     },
 ]
 ```
 
-To add a board, append a new entry with the appropriate `base_url`, `board_id`, `target_epics`, and `customer`. Add `zephyr_project_key` only if the board has Zephyr Scale installed.
+To add a board, append a new entry with `base_url`, `board_id`, `target_epics`, and `customer`. Add `zephyr_project_key` to enable Zephyr auto-fetch. Add `zephyr_folder` to restrict to a specific folder subtree (partial, case-insensitive match against root-level folders).
 
 ## Zephyr Scale Setup
 
-The Xander/HEAL board has Zephyr Scale (SmartBear) installed. The script automatically fetches how many test cases in the **current sprint** are executed (Pass/Fail/Blocked) vs outstanding (Unexecuted/other).
+Both boards have Zephyr Scale (SmartBear) installed. The script automatically fetches how many test cases linked to sprint issues are executed (Pass/Fail/Blocked) vs outstanding (Unexecuted/other).
+
+Because the Zephyr `/v2/testcases` API ignores `issueKey` and `folderId` query params, the script fetches all project TCs and filters client-side using each TC's `links.issues[].issueId` (matched against integer Jira issue IDs) and `folder.id` (matched against the configured folder subtree via BFS on `parentId`).
 
 **To generate the API key:**
 
