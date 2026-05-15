@@ -25,7 +25,9 @@ Copy `.env.example` to `.env` and fill in:
 
 ## Zephyr Scale integration
 
-The Xander/HEAL board has `zephyr_project_key: "HEAL"` set, enabling automatic test case fetching.
+Both boards have `zephyr_project_key: "HEAL"`. Xander also has `zephyr_folder: "Xander AI"` which restricts fetching to the Xander AI folder subtree. Dixie has no `zephyr_folder` — it fetches any TC linked to Dixie sprint issues regardless of folder. To add folder filtering for Dixie later, add `"zephyr_folder": "<folder name>"` to its board config.
+
+The fetch logic (same for both boards): fetch all project TCs, get each TC's detail (folder.id + links.issues[].issueId), keep only TCs that pass the folder filter (if set) AND are linked to a sprint issue by integer Jira issue ID. The `/v2/testcases` issueKey and folderId query params are silently ignored by the Zephyr API and must not be relied on.
 
 **How to get the API key:**
 1. Go to `https://futuresecureai.atlassian.net`
@@ -65,14 +67,14 @@ Single-file script (`qa_report.py`). Flow:
 
 | Board | URL | Board ID | Epics tracked |
 |---|---|---|---|
-| Healius / FDW | healius-digital.atlassian.net | 402 | Reva, Melinda, Dixie |
+| Dixie / HEAL | futuresecureai.atlassian.net | 3566 | Dixie |
 | Xander / HEAL | futuresecureai.atlassian.net | 3426 | Xander |
 
 Both boards hardcode `customer = "Healius"`.
 
 ## Key behaviours
 
-- **AICW field**: built from `target_epics` keywords matched in epic titles **or** the sprint name (e.g. "Melinda" from sprint "FDW UC 1.2 Melinda Sprint 11"), joined with `/`.
+- **AICW field**: built from `target_epics` keywords matched in epic titles **or** the sprint name (e.g. "Dixie" from sprint "HEAL Dixie Sprint 5"), joined with `/`.
 - **Status mapping**: `READY FOR QA` + `IN TESTING` → Pending; `AWAITING DEPLOYMENT` + `DONE` → Tested.
 - **Epic filter fallback**: if no target epics are found, all non-Epic sprint issues are counted and a warning is printed with the available epic names.
 - **UAT section**: omitted entirely (shows `UAT Status – N/A`) when user answers `n`.

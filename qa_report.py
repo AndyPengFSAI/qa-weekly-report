@@ -26,11 +26,12 @@ load_dotenv()
 
 BOARDS = [
     {
-        "label":        "Healius / FDW  (Reva · Melinda · Dixie)",
-        "base_url":     "https://healius-digital.atlassian.net",
-        "board_id":     "402",
-        "target_epics": ["Reva", "Melinda", "Dixie"],
-        "customer":     "Healius",
+        "label":             "Dixie / HEAL",
+        "base_url":          "https://futuresecureai.atlassian.net",
+        "board_id":          "3566",
+        "target_epics":      ["Dixie"],
+        "customer":          "Healius",
+        "zephyr_project_key": "HEAL",
     },
     {
         "label":             "Xander / HEAL",
@@ -39,6 +40,7 @@ BOARDS = [
         "target_epics":      ["Xander"],
         "customer":          "Healius",
         "zephyr_project_key": "HEAL",
+        "zephyr_folder":     "Xander AI",
     },
 ]
 
@@ -200,8 +202,8 @@ def fetch_via_rest(board: dict) -> dict:
     team_member = r.json().get("displayName", "Unknown")
 
     # 2. Active sprint — prefer the sprint whose name contains a target_epic keyword.
-    #    Boards like FDW/402 run multiple parallel active sprints (Oscar, Melinda, etc.)
-    #    so we must pick the right one rather than blindly taking [0].
+    #    Boards may run multiple parallel active sprints, so we pick the one whose
+    #    name contains a target_epic keyword rather than blindly taking [0].
     r = requests.get(
         f"{base_url}/rest/agile/1.0/board/{board_id}/sprint",
         params={"state": "active"},
@@ -319,7 +321,7 @@ def fetch_via_rest(board: dict) -> dict:
         ]
 
     # Build AICW: keywords from target_epics that appear in matched epic names
-    # OR in the sprint name (e.g. "FDW UC 1.2 Melinda Sprint 11" → Melinda).
+    # OR in the sprint name (e.g. "HEAL Dixie Sprint 5" → Dixie).
     # Preserve order from target_epics; join with "/".
     aicw_keywords: list[str] = []
     seen_kw: set[str] = set()
@@ -344,13 +346,15 @@ def fetch_via_rest(board: dict) -> dict:
         if i["fields"]["status"]["name"].upper() in TESTED_STATUSES
     )
 
-    # Zephyr Scale test case stats — sprint-scoped via issue links
+    # Zephyr Scale test case stats — sprint-scoped via Jira issue IDs
+    # (Zephyr /v2/testcases ignores issueKey; issueId integers from TC detail are reliable)
     zephyr_stats: dict | None = None
     if board.get("zephyr_project_key"):
         try:
-            sprint_issue_keys = {issue["key"] for issue in filtered}
+            sprint_issue_ids = {int(issue["id"]) for issue in filtered}
             zephyr_stats = fetch_zephyr_test_stats(
-                board["zephyr_project_key"], sprint_issue_keys
+                board["zephyr_project_key"], sprint_issue_ids,
+                folder_name=board.get("zephyr_folder"),
             )
         except Exception as z_err:
             print(f"  ⚠ Zephyr fetch failed ({z_err})")
@@ -370,22 +374,27 @@ def fetch_via_rest(board: dict) -> dict:
 # Data fetching — Zephyr Scale (sprint-scoped test case stats)
 # ---------------------------------------------------------------------------
 
-def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
+def fetch_zephyr_test_stats(project_key: str, sprint_issue_ids: set,
+                            folder_name: str | None = None) -> dict:
     """
     Fetch test case execution stats from Zephyr Scale, scoped to the current sprint.
 
-    Only counts test cases linked to at least one Jira issue in sprint_issue_keys.
-    Returns executed / outstanding based on the LATEST execution status per test case.
+    sprint_issue_ids: set of integer Jira issue IDs (issue["id"] cast to int).
+    folder_name: if set, restrict to TCs inside that folder subtree (partial,
+      case-insensitive match against root-level folders only).
+      Returns 0 immediately if the folder doesn't exist yet.
 
-    Key API facts (discovered from live data):
-    - testexecutions uses field "testExecutionStatus" (not "status") with only {id, self}
-    - testexecutions are returned ASCENDING (oldest first), so the LAST item is latest
-    - testCase field in executions has no "key"; extract it from the "self" URL
+    Key API facts discovered from live data:
+    - /v2/testcases ignores issueKey and folderId query params — always returns all
+      project TCs.  Filtering must be done client-side from TC detail responses.
+    - GET /v2/testcases/{key} includes folder.id (int) and links.issues[].issueId (int).
+    - testexecutions uses field "testExecutionStatus" (not "status") with only {id, self}.
+    - testexecutions are returned ASCENDING (oldest first) — last item is latest.
     """
     headers   = _zephyr_headers()
     page_size = 100
 
-    # 0. Build status ID → name map for this project (fetched once, not hardcoded).
+    # 0. Build status ID → name map for this project.
     r = requests.get(
         f"{ZEPHYR_BASE}/statuses",
         params={"projectKey": project_key, "statusType": "TEST_EXECUTION", "maxResults": 50},
@@ -396,59 +405,101 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
     status_id_to_name: dict[int, str] = {
         s["id"]: s["name"] for s in r.json().get("values", [])
     }
-    # IDs for statuses considered "executed" (Pass / Fail / Blocked)
     executed_ids: set[int] = {
         sid for sid, name in status_id_to_name.items()
         if name.lower() in ZEPHYR_EXECUTED_STATUSES
     }
 
-    # 1. Collect unique test case keys linked to any sprint issue.
-    sprint_tc_keys: list[str] = []
-    seen_tc_keys:   set[str]  = set()
+    # 0b. If folder_name set, BFS the folder tree to collect all descendant folder IDs.
+    #     Only match against root-level folders (parentId=null) to avoid accidental
+    #     sub-folder matches.  Return 0 immediately if not found yet.
+    valid_folder_ids: set[int] | None = None
+    if folder_name:
+        r = requests.get(
+            f"{ZEPHYR_BASE}/folders",
+            params={"projectKey": project_key, "folderType": "TEST_CASE", "maxResults": 200},
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        all_folders = r.json().get("values", [])
 
-    for issue_key in sprint_issue_keys:
-        start_at = 0
-        while True:
-            r = requests.get(
-                f"{ZEPHYR_BASE}/testcases",
-                params={
-                    "projectKey": project_key,
-                    "issueKey":   issue_key,
-                    "maxResults": page_size,
-                    "startAt":    start_at,
-                },
-                headers=headers,
-                timeout=20,
-            )
-            r.raise_for_status()
-            body  = r.json()
-            page  = body.get("values", [])
-            for tc in page:
-                tc_key = tc.get("key", "")
-                if tc_key and tc_key not in seen_tc_keys:
-                    sprint_tc_keys.append(tc_key)
-                    seen_tc_keys.add(tc_key)
-            total    = body.get("total", 0)
-            start_at += len(page)
-            if start_at >= total or not page:
-                break
+        root_ids = {
+            f["id"] for f in all_folders
+            if folder_name.lower() in f.get("name", "").lower()
+            and f.get("parentId") is None
+        }
+        if not root_ids:
+            print(f"  ℹ Zephyr folder matching '{folder_name}' not found — skipping pre-fill.")
+            return {"executed": 0, "outstanding": 0, "total": 0}
+
+        parent_to_children: dict[int, list[int]] = {}
+        for f in all_folders:
+            pid = f.get("parentId")
+            if pid is not None:
+                parent_to_children.setdefault(pid, []).append(f["id"])
+
+        valid_folder_ids = set(root_ids)
+        queue = list(root_ids)
+        while queue:
+            fid = queue.pop()
+            for child_id in parent_to_children.get(fid, []):
+                if child_id not in valid_folder_ids:
+                    valid_folder_ids.add(child_id)
+                    queue.append(child_id)
+
+    # 1. Fetch all TC keys in the project (issueKey/folderId params are silently ignored
+    #    by the Zephyr API, so we must fetch everything and filter client-side).
+    all_tc_keys: list[str] = []
+    start_at = 0
+    while True:
+        r = requests.get(
+            f"{ZEPHYR_BASE}/testcases",
+            params={"projectKey": project_key, "maxResults": page_size, "startAt": start_at},
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        body = r.json()
+        page = body.get("values", [])
+        all_tc_keys.extend(tc["key"] for tc in page if tc.get("key"))
+        total    = body.get("total", 0)
+        start_at += len(page)
+        if start_at >= total or not page:
+            break
+
+    # 2. For each TC, fetch detail to get folder.id and links.issues[].issueId,
+    #    then apply folder filter and sprint-issue filter.
+    sprint_tc_keys: list[str] = []
+    for tc_key in all_tc_keys:
+        r = requests.get(
+            f"{ZEPHYR_BASE}/testcases/{tc_key}",
+            headers=headers,
+            timeout=20,
+        )
+        if not r.ok:
+            continue
+        tc = r.json()
+
+        if valid_folder_ids is not None:
+            if (tc.get("folder") or {}).get("id") not in valid_folder_ids:
+                continue
+
+        linked_ids = {
+            lnk["issueId"]
+            for lnk in (tc.get("links") or {}).get("issues", [])
+        }
+        if not linked_ids & sprint_issue_ids:
+            continue
+
+        sprint_tc_keys.append(tc_key)
 
     if not sprint_tc_keys:
         return {"executed": 0, "outstanding": 0, "total": 0}
 
-    # 2. For each TC key, fetch its executions and inspect the LAST one (newest).
-    #    The API returns executions in ASCENDING date order, so the last item is
-    #    the most recent execution.  We also fall back to the highest actualEndDate
-    #    across all pages in case ordering is inconsistent.
-    def _tc_key_from_exec(ex: dict) -> str:
-        """Extract TC key (e.g. HEAL-T38) from the self URL in the testCase field."""
-        import re as _re
-        self_url = (ex.get("testCase") or {}).get("self", "")
-        m = _re.search(r"/testcases/([^/]+)/versions", self_url)
-        return m.group(1) if m else ""
-
-    latest_status_id: dict[str, int] = {}   # tc_key → status id of latest execution
-    latest_date:      dict[str, str] = {}   # tc_key → actualEndDate for tie-breaking
+    # 3. For each sprint TC, fetch executions and find the latest status.
+    latest_status_id: dict[str, int] = {}
+    latest_date:      dict[str, str] = {}
 
     for tc_key in sprint_tc_keys:
         start_at = 0
@@ -472,7 +523,6 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
                 if status_id is None:
                     continue
                 date = ex.get("actualEndDate") or ""
-                # Keep the execution with the latest date
                 if tc_key not in latest_date or date >= latest_date[tc_key]:
                     latest_status_id[tc_key] = status_id
                     latest_date[tc_key]      = date
@@ -481,11 +531,11 @@ def fetch_zephyr_test_stats(project_key: str, sprint_issue_keys: set) -> dict:
             if start_at >= total or not page:
                 break
 
-    # 3. Count executed vs outstanding.
+    # 4. Count executed vs outstanding.
     executed    = 0
     outstanding = 0
     for tc_key in sprint_tc_keys:
-        sid = latest_status_id.get(tc_key)   # None → never executed
+        sid = latest_status_id.get(tc_key)
         if sid is not None and sid in executed_ids:
             executed += 1
         else:
